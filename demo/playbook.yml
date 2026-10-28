@@ -1,0 +1,192 @@
+---
+# Requires lastName only for the clients that carry the last-name-required client scope:
+# billing puts the full name on invoices and asks for it, chat is fine with a first name.
+# Run it with `make` from this folder, then sign in through
+# both clients in the browser with the links the last task prints.
+- name: Playbook for a User Profile attribute required per client scope
+  hosts: all
+  gather_facts: false
+  vars:
+    keycloak_admin_user: admin
+    keycloak_admin_password: "remembertochangeme"
+    keycloak_url: "http://localhost:8080"
+    keycloak_realm: TestRealm
+    keycloak_auth: &keycloak_auth
+      auth_keycloak_url: "{{ keycloak_url }}"
+      auth_realm: master
+      auth_username: "{{ keycloak_admin_user }}"
+      auth_password: "{{ keycloak_admin_password }}"
+    keycloak_user_password: password
+    # Keycloak's hosted test SPA, so the clients need no app of their own.
+    demo_app_url: https://www.keycloak.org/app/
+  tasks:
+    - name: Create realm
+      middleware_automation.keycloak.keycloak_realm:
+        <<: *keycloak_auth
+        id: "{{ keycloak_realm }}"
+        realm: "{{ keycloak_realm }}"
+        enabled: true
+        state: present
+
+    - name: Create the client scope that makes lastName required
+      middleware_automation.keycloak.keycloak_client_scope:
+        <<: *keycloak_auth
+        realm: "{{ keycloak_realm }}"
+        name: last-name-required
+        protocol: openid-connect
+        attributes:
+          include.in.token.scope: "false"
+        state: present
+
+    - name: Create clients with and without the scope
+      middleware_automation.keycloak.keycloak_client:
+        <<: *keycloak_auth
+        realm: "{{ keycloak_realm }}"
+        client_id: "{{ item.client_id }}"
+        description: "{{ item.description }}"
+        public_client: true
+        standard_flow_enabled: true
+        direct_access_grants_enabled: true
+        redirect_uris:
+          - "{{ demo_app_url }}*"
+        web_origins:
+          - "{{ demo_app_url | urlsplit('scheme') }}://{{ demo_app_url | urlsplit('netloc') }}"
+        default_client_scopes: "{{ ['basic', 'profile', 'email'] + item.extra_scopes }}"
+        state: present
+      loop:
+        - client_id: billing
+          description: Puts the full name on invoices, so it requires the last name
+          extra_scopes:
+            - last-name-required
+        - client_id: chat
+          description: Shows the first name only, so it lets users in without a last name
+          extra_scopes: []
+
+    - name: Require lastName for the last-name-required scope only
+      middleware_automation.keycloak.keycloak_userprofile:
+        <<: *keycloak_auth
+        parent_id: "{{ keycloak_realm }}"
+        state: present
+        config:
+          kc_user_profile_config:
+            - attributes:
+                - name: username
+                  display_name: "${username}"
+                  validations:
+                    length:
+                      min: 3
+                      max: 255
+                    username_prohibited_characters: {}
+                    up_username_not_idn_homograph: {}
+                  permissions:
+                    view:
+                      - admin
+                      - user
+                    edit:
+                      - admin
+                      - user
+                - name: email
+                  display_name: "${email}"
+                  validations:
+                    email: {}
+                    length:
+                      max: 255
+                  required:
+                    roles:
+                      - user
+                  permissions:
+                    view:
+                      - admin
+                      - user
+                    edit:
+                      - admin
+                      - user
+                - name: firstName
+                  display_name: "${firstName}"
+                  validations:
+                    length:
+                      max: 255
+                    person_name_prohibited_characters: {}
+                  required:
+                    roles:
+                      - user
+                  permissions:
+                    view:
+                      - admin
+                      - user
+                    edit:
+                      - admin
+                      - user
+                - name: lastName
+                  display_name: "${lastName}"
+                  validations:
+                    length:
+                      max: 255
+                    person_name_prohibited_characters: {}
+                  required:
+                    roles:
+                      - user
+                    scopes:
+                      - last-name-required
+                  permissions:
+                    view:
+                      - admin
+                      - user
+                    edit:
+                      - admin
+                      - user
+
+    - name: Remove the user a previous run may have given a last name
+      middleware_automation.keycloak.keycloak_user:
+        <<: *keycloak_auth
+        realm: "{{ keycloak_realm }}"
+        username: no-last-name
+        state: absent
+
+    - name: Create a user without a last name
+      middleware_automation.keycloak.keycloak_user:
+        <<: *keycloak_auth
+        realm: "{{ keycloak_realm }}"
+        username: no-last-name
+        email: no-last-name@example.com
+        email_verified: true
+        first_name: Test
+        enabled: true
+        credentials:
+          - type: password
+            value: "{{ keycloak_user_password }}"
+            temporary: false
+        state: present
+
+    - name: Log the user in through each client
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/{{ keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        use_netrc: false
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: "{{ item }}"
+          username: no-last-name
+          password: "{{ keycloak_user_password }}"
+        status_code:
+          - 200
+          - 400
+      loop:
+        - billing
+        - chat
+      register: logins
+
+    - name: Assert only the client with the scope asks for the last name
+      ansible.builtin.assert:
+        that:
+          - logins.results[0].status == 400
+          - logins.results[0].json.error_description == "Account is not fully set up"
+          - logins.results[1].status == 200
+
+    - name: Show how to see it in the browser
+      ansible.builtin.debug:
+        msg:
+          - "Sign in as no-last-name / {{ keycloak_user_password }} through each client:"
+          - "billing asks for the last name: {{ demo_app_url }}?url={{ keycloak_url }}&realm={{ keycloak_realm }}&client=billing"
+          - "chat lets the user straight in: {{ demo_app_url }}?url={{ keycloak_url }}&realm={{ keycloak_realm }}&client=chat"
